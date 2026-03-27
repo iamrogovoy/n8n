@@ -6,6 +6,7 @@ import {
 	mockInstance,
 	createActiveWorkflow,
 	createWorkflowWithHistory,
+	linkUserToProject,
 } from '@n8n/backend-test-utils';
 import { GlobalConfig } from '@n8n/config';
 import type { Project, TagEntity, User, WorkflowHistory } from '@n8n/db';
@@ -14,6 +15,7 @@ import {
 	ProjectRepository,
 	WorkflowHistoryRepository,
 	SharedWorkflowRepository,
+	ProjectRelationRepository,
 } from '@n8n/db';
 import { Container } from '@n8n/di';
 import { Not } from '@n8n/typeorm';
@@ -21,6 +23,7 @@ import { InstanceSettings } from 'n8n-core';
 import type { INode } from 'n8n-workflow';
 import { v4 as uuid } from 'uuid';
 
+import { createCustomRoleWithScopeSlugs, cleanupRolesAndScopes } from '../shared/db/roles';
 import { createTag } from '../shared/db/tags';
 import { createMemberWithApiKey, createOwnerWithApiKey } from '../shared/db/users';
 import { createWorkflowHistoryItem } from '../shared/db/workflow-history';
@@ -81,7 +84,36 @@ beforeEach(async () => {
 		'CredentialsEntity',
 		'WorkflowHistory',
 		'WorkflowPublishHistory',
+		'ProjectRelation',
+		'Project',
 	]);
+	await cleanupRolesAndScopes();
+
+	const projectRepository = Container.get(ProjectRepository);
+	const projectRelationRepository = Container.get(ProjectRelationRepository);
+	const createPersonalProject = async (user: User) => {
+		const project = await projectRepository.save(
+			projectRepository.create({
+				type: 'personal',
+				name: user.createPersonalProjectName(),
+				creatorId: user.id,
+			}),
+		);
+
+		await projectRelationRepository.save(
+			projectRelationRepository.create({
+				projectId: project.id,
+				userId: user.id,
+				role: { slug: 'project:personalOwner' },
+			}),
+		);
+
+		return project;
+	};
+
+	// Recreate personal projects that were deleted by truncate
+	ownerPersonalProject = await createPersonalProject(owner);
+	memberPersonalProject = await createPersonalProject(member);
 
 	authOwnerAgent = testServer.publicApiAgentFor(owner);
 	authMemberAgent = testServer.publicApiAgentFor(member);
@@ -130,6 +162,10 @@ describe('GET /workflows', () => {
 				name,
 				createdAt,
 				updatedAt,
+				isArchived,
+				versionId,
+				triggerCount,
+				meta,
 				tags,
 			} = workflow;
 
@@ -144,6 +180,10 @@ describe('GET /workflows', () => {
 			expect(settings).toBeDefined();
 			expect(createdAt).toBeDefined();
 			expect(updatedAt).toBeDefined();
+			expect(isArchived).toBe(false);
+			expect(versionId).toBeDefined();
+			expect(triggerCount).toBeDefined();
+			expect(meta).toBeDefined();
 		}
 	});
 
@@ -183,6 +223,10 @@ describe('GET /workflows', () => {
 				name,
 				createdAt,
 				updatedAt,
+				isArchived,
+				versionId,
+				triggerCount,
+				meta,
 				tags,
 			} = workflow;
 
@@ -197,6 +241,10 @@ describe('GET /workflows', () => {
 			expect(settings).toBeDefined();
 			expect(createdAt).toBeDefined();
 			expect(updatedAt).toBeDefined();
+			expect(isArchived).toBe(false);
+			expect(versionId).toBeDefined();
+			expect(triggerCount).toBeDefined();
+			expect(meta).toBeDefined();
 		}
 
 		// check that we really received a different result
@@ -546,6 +594,10 @@ describe('GET /workflows/:id', () => {
 			name,
 			createdAt,
 			updatedAt,
+			isArchived,
+			versionId,
+			triggerCount,
+			meta,
 			tags,
 		} = response.body;
 
@@ -560,6 +612,10 @@ describe('GET /workflows/:id', () => {
 		expect(settings).toEqual(workflow.settings);
 		expect(createdAt).toEqual(workflow.createdAt.toISOString());
 		expect(updatedAt).toEqual(workflow.updatedAt.toISOString());
+		expect(isArchived).toBe(false);
+		expect(versionId).toBeDefined();
+		expect(triggerCount).toBe(0);
+		expect(meta).toBeDefined();
 	});
 
 	test('should retrieve non-owned workflow for owner', async () => {
@@ -581,6 +637,10 @@ describe('GET /workflows/:id', () => {
 			name,
 			createdAt,
 			updatedAt,
+			isArchived,
+			versionId,
+			triggerCount,
+			meta,
 		} = response.body;
 
 		expect(id).toEqual(workflow.id);
@@ -593,6 +653,10 @@ describe('GET /workflows/:id', () => {
 		expect(settings).toEqual(workflow.settings);
 		expect(createdAt).toEqual(workflow.createdAt.toISOString());
 		expect(updatedAt).toEqual(workflow.updatedAt.toISOString());
+		expect(isArchived).toBe(false);
+		expect(versionId).toBeDefined();
+		expect(triggerCount).toBe(0);
+		expect(meta).toBeDefined();
 	});
 
 	test('should retrieve workflow without pinned data', async () => {
@@ -984,6 +1048,28 @@ describe('POST /workflows/:id/activate', () => {
 		// check whether the workflow is on the active workflow runner
 		expect(await workflowRepository.isActive(workflow.id)).toBe(true);
 	});
+
+	test('should return 403 when user lacks workflow:publish permission', async () => {
+		// Create a custom role with workflow:update but not workflow:publish
+		const customRole = await createCustomRoleWithScopeSlugs(['workflow:read', 'workflow:update'], {
+			roleType: 'project',
+			displayName: 'Custom Workflow Updater',
+			description: 'Can update workflows but not publish them',
+		});
+
+		const teamProject = await createTeamProject('Test Project', owner);
+		await linkUserToProject(member, teamProject, customRole.slug);
+
+		const workflow = await createWorkflowWithTriggerAndHistory({}, teamProject);
+
+		const response = await authMemberAgent.post(`/workflows/${workflow.id}/activate`);
+
+		expect(response.statusCode).toBe(403);
+
+		const workflowAfter = await workflowRepository.findOne({ where: { id: workflow.id } });
+		expect(workflowAfter?.active).toBe(false);
+		expect(workflowAfter?.activeVersionId).toBeNull();
+	});
 });
 
 describe('POST /workflows/:id/deactivate', () => {
@@ -1081,6 +1167,28 @@ describe('POST /workflows/:id/deactivate', () => {
 		expect(sharedWorkflow?.workflow.activeVersionId).toBeNull();
 	});
 
+	test('should return 403 when user lacks workflow:publish permission', async () => {
+		// Create a custom role with workflow:update but not workflow:publish
+		const customRole = await createCustomRoleWithScopeSlugs(['workflow:read', 'workflow:update'], {
+			roleType: 'project',
+			displayName: 'Custom Workflow Updater',
+			description: 'Can update workflows but not publish them',
+		});
+
+		const teamProject = await createTeamProject('Test Project', owner);
+		await linkUserToProject(member, teamProject, customRole.slug);
+
+		const workflow = await createActiveWorkflow({}, teamProject);
+
+		const response = await authMemberAgent.post(`/workflows/${workflow.id}/deactivate`);
+
+		expect(response.statusCode).toBe(403);
+
+		const workflowAfter = await workflowRepository.findOne({ where: { id: workflow.id } });
+		expect(workflowAfter?.active).toBe(true);
+		expect(workflowAfter?.activeVersionId).not.toBeNull();
+	});
+
 	test('should deactivate non-owned workflow when owner', async () => {
 		const workflow = await createWorkflowWithTriggerAndHistory({}, member);
 
@@ -1135,6 +1243,123 @@ describe('POST /workflows/:id/deactivate', () => {
 		expect(sharedWorkflow?.workflow.activeVersionId).toBeNull();
 
 		expect(await workflowRepository.isActive(workflow.id)).toBe(false);
+	});
+});
+
+describe('POST /workflows/:id/archive', () => {
+	test('should fail due to missing API Key', testWithAPIKey('post', '/workflows/2/archive', null));
+
+	test(
+		'should fail due to invalid API Key',
+		testWithAPIKey('post', '/workflows/2/archive', 'abcXYZ'),
+	);
+
+	test('should return 404 when workflow does not exist', async () => {
+		const response = await authOwnerAgent.post(
+			'/workflows/00000000-0000-0000-0000-000000000000/archive',
+		);
+		expect(response.statusCode).toBe(404);
+	});
+
+	test('should archive workflow and return 200', async () => {
+		const workflow = await createWorkflowWithTriggerAndHistory({}, member);
+
+		const response = await authMemberAgent.post(`/workflows/${workflow.id}/archive`);
+
+		expect(response.statusCode).toBe(200);
+		expect(response.body.isArchived).toBe(true);
+		expect(response.body.id).toBe(workflow.id);
+	});
+
+	test('should return 200 when already archived (idempotent)', async () => {
+		const workflow = await createWorkflowWithTriggerAndHistory({}, member);
+
+		await authMemberAgent.post(`/workflows/${workflow.id}/archive`);
+
+		const second = await authMemberAgent.post(`/workflows/${workflow.id}/archive`);
+		expect(second.statusCode).toBe(200);
+		expect(second.body.isArchived).toBe(true);
+	});
+
+	test('should return 403 when user lacks workflow:delete permission', async () => {
+		const customRole = await createCustomRoleWithScopeSlugs(['workflow:read', 'workflow:update'], {
+			roleType: 'project',
+			displayName: 'Custom Workflow Editor No Delete',
+			description: 'Can read and update workflows but not delete or archive them',
+		});
+
+		const teamProject = await createTeamProject('Test Project', owner);
+		await linkUserToProject(member, teamProject, customRole.slug);
+
+		const workflow = await createWorkflowWithTriggerAndHistory({}, teamProject);
+
+		const response = await authMemberAgent.post(`/workflows/${workflow.id}/archive`);
+
+		expect(response.statusCode).toBe(403);
+
+		const workflowAfter = await workflowRepository.findOne({ where: { id: workflow.id } });
+		expect(workflowAfter?.isArchived).toBe(false);
+	});
+});
+
+describe('POST /workflows/:id/unarchive', () => {
+	test(
+		'should fail due to missing API Key',
+		testWithAPIKey('post', '/workflows/2/unarchive', null),
+	);
+
+	test(
+		'should fail due to invalid API Key',
+		testWithAPIKey('post', '/workflows/2/unarchive', 'abcXYZ'),
+	);
+
+	test('should return 404 when workflow does not exist', async () => {
+		const response = await authOwnerAgent.post(
+			'/workflows/00000000-0000-0000-0000-000000000000/unarchive',
+		);
+		expect(response.statusCode).toBe(404);
+	});
+
+	test('should return 400 when workflow is not archived', async () => {
+		const workflow = await createWorkflowWithTriggerAndHistory({}, member);
+
+		const response = await authMemberAgent.post(`/workflows/${workflow.id}/unarchive`);
+
+		expect(response.statusCode).toBe(400);
+	});
+
+	test('should return 403 when user lacks workflow:delete permission', async () => {
+		const customRole = await createCustomRoleWithScopeSlugs(['workflow:read', 'workflow:update'], {
+			roleType: 'project',
+			displayName: 'Custom Workflow Editor No Delete',
+			description: 'Can read and update workflows but not delete or archive them',
+		});
+
+		const teamProject = await createTeamProject('Test Project Unarchive', owner);
+		await linkUserToProject(member, teamProject, customRole.slug);
+
+		const workflow = await createWorkflowWithTriggerAndHistory({}, teamProject);
+
+		await authOwnerAgent.post(`/workflows/${workflow.id}/archive`);
+
+		const response = await authMemberAgent.post(`/workflows/${workflow.id}/unarchive`);
+
+		expect(response.statusCode).toBe(403);
+
+		const workflowAfter = await workflowRepository.findOne({ where: { id: workflow.id } });
+		expect(workflowAfter?.isArchived).toBe(true);
+	});
+
+	test('should unarchive workflow and return 200', async () => {
+		const workflow = await createWorkflowWithTriggerAndHistory({}, member);
+
+		await authMemberAgent.post(`/workflows/${workflow.id}/archive`);
+
+		const response = await authMemberAgent.post(`/workflows/${workflow.id}/unarchive`);
+
+		expect(response.statusCode).toBe(200);
+		expect(response.body.isArchived).toBe(false);
+		expect(response.body.id).toBe(workflow.id);
 	});
 });
 
@@ -1216,6 +1441,32 @@ describe('POST /workflows', () => {
 		expect(sharedWorkflow?.workflow.name).toBe(name);
 		expect(sharedWorkflow?.workflow.createdAt.toISOString()).toBe(createdAt);
 		expect(sharedWorkflow?.role).toEqual('workflow:owner');
+	});
+
+	test('should assign webhookId to webhook nodes created via public API', async () => {
+		const payload = {
+			name: 'webhook-test',
+			nodes: [
+				{
+					id: 'uuid-1234',
+					parameters: { path: 'test-hook', httpMethod: 'POST' },
+					name: 'Webhook',
+					type: 'n8n-nodes-base.webhook',
+					typeVersion: 2,
+					position: [250, 300],
+				},
+			],
+			connections: {},
+			settings: {
+				executionOrder: 'v1',
+			},
+		};
+
+		const response = await authOwnerAgent.post('/workflows').send(payload);
+
+		expect(response.statusCode).toBe(200);
+		expect(response.body.nodes[0].webhookId).toBeDefined();
+		expect(typeof response.body.nodes[0].webhookId).toBe('string');
 	});
 
 	test('should always create workflow history version', async () => {

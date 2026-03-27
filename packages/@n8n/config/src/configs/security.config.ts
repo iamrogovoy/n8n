@@ -1,4 +1,8 @@
+import z from 'zod';
+
 import { Config, Env } from '../decorators';
+
+const crossOriginOpenerPolicySchema = z.enum(['same-origin', 'same-origin-allow-popups']);
 
 @Config
 export class SecurityConfig {
@@ -21,6 +25,13 @@ export class SecurityConfig {
 	blockFileAccessToN8nFiles: boolean = true;
 
 	/**
+	 * Regex patterns for files and folders that `ReadWriteFile` and `ReadBinaryFiles` nodes cannot access.
+	 * Separate multiple patterns with semicolons. Default blocks `.git`. Set to empty to disable pattern-based blocking.
+	 */
+	@Env('N8N_BLOCK_FILE_PATTERNS')
+	blockFilePatterns: string = '^(.*\\/)*\\.git(\\/.*)*$';
+
+	/**
 	 * In a [security audit](https://docs.n8n.io/hosting/securing/security-audit/), how many days for a workflow to be considered abandoned if not executed.
 	 */
 	@Env('N8N_SECURITY_AUDIT_DAYS_ABANDONED_WORKFLOW')
@@ -41,11 +52,28 @@ export class SecurityConfig {
 	contentSecurityPolicyReportOnly: boolean = false;
 
 	/**
+	 * Configuration for the `Cross-Origin-Opener-Policy` header.
+	 */
+	@Env('N8N_CROSS_ORIGIN_OPENER_POLICY', crossOriginOpenerPolicySchema)
+	crossOriginOpenerPolicy: z.infer<typeof crossOriginOpenerPolicySchema> = 'same-origin';
+
+	/**
 	 * Whether to disable HTML sandboxing for webhooks. The sandboxing mechanism uses CSP headers now,
 	 * but the name is kept for backwards compatibility.
 	 */
 	@Env('N8N_INSECURE_DISABLE_WEBHOOK_IFRAME_SANDBOX')
 	disableWebhookHtmlSandboxing: boolean = false;
+
+	/**
+	 * Whether to disable CSP sandboxing for form pages (Form Trigger, Send and Wait).
+	 *
+	 * WARNING: Disabling CSP protection leaves the instance vulnerable to attacks where a
+	 * malicious user can build a workflow that makes requests using other users' credentials.
+	 * The correct way to prevent this is to configure forms to be served from a different
+	 * (sub)domain instead of disabling the sandbox.
+	 */
+	@Env('N8N_INSECURE_DISABLE_FORM_HTML_SANDBOX')
+	disableFormHtmlSandboxing: boolean = false;
 
 	/**
 	 * Whether to disable bare repositories support in the Git node.
